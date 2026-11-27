@@ -544,14 +544,16 @@ function UnitTests.RunAll()
 
         assertEq("Policy PullToCamp: family", policies['PullToCamp'].family, 'camp')
         assertEq("Policy ChainToCamp: family", policies['ChainToCamp'].family, 'camp')
+        assertEq("Policy BatchToCamp: family", policies['BatchToCamp'].family, 'camp')
         assertEq("Policy AreaHunt: family", policies['AreaHunt'].family, 'hunt')
         assertEq("Policy RoamingHunt: family", policies['RoamingHunt'].family, 'hunt')
         assertEq("Policy CircuitHunt: family", policies['CircuitHunt'].family, 'hunt')
         assertEq("Policy FightTo: family", policies['FightTo'].family, 'directive')
 
         for name, policy in pairs(policies) do
-            assertEq(string.format("Policy %s: combat exemption is chain-only", name), policy.runsDuringCombat, name == 'ChainToCamp')
-            assertEq(string.format("Policy %s: chain success check is chain-only", name), policy.successCheck == 'chainCount', name == 'ChainToCamp')
+            assertEq(string.format("Policy %s: combat exemption is camp-chain-only", name), policy.runsDuringCombat, name == 'ChainToCamp' or name == 'BatchToCamp')
+            assertEq(string.format("Policy %s: count success check is camp-count-only", name),
+                policy.successCheck == 'chainCount' or policy.successCheck == 'batchCount', name == 'ChainToCamp' or name == 'BatchToCamp')
             assertEq(string.format("Policy %s: rescan-to-closer off only for FightTo", name), policy.rescanToCloser, name ~= 'FightTo')
             assertEq(string.format("Policy %s: objective only outside roam and circuit", name), policy.hasObjective, name ~= 'RoamingHunt' and name ~= 'CircuitHunt')
             assertEq(string.format("Policy %s: hunt radius setting", name), policy.radiusSetting == 'PullRadiusHunt', policy.family == 'hunt')
@@ -571,6 +573,11 @@ function UnitTests.RunAll()
         assertEq("PullSuccessCheck chainCount: below count", Pull:PullSuccessCheck('chainCount', 2, 3), false)
         assertEq("PullSuccessCheck chainCount: at count", Pull:PullSuccessCheck('chainCount', 3, 3), true)
         assertEq("PullSuccessCheck chainCount: above count", Pull:PullSuccessCheck('chainCount', 4, 3), true)
+        assertEq("PullSuccessCheck batchCount: below count", Pull:PullSuccessCheck('batchCount', 2, 3), false)
+        assertEq("PullSuccessCheck batchCount: at count", Pull:PullSuccessCheck('batchCount', 3, 3), true)
+        assertEq("Batch collection continues below target", Pull:ShouldContinueBatchCollection(false, false, nil), true)
+        assertEq("Batch collection stops at target", Pull:ShouldContinueBatchCollection(true, false, nil), false)
+        assertEq("Batch collection stops when aborted", Pull:ShouldContinueBatchCollection(false, false, "timeout"), false)
     end
 
     -- Pull abort profile tests
@@ -663,6 +670,8 @@ function UnitTests.RunAll()
         -- Camp family: ChainToCamp happy path
         checkSentence("Intent ChainToCamp here solo",
             Pull:BuildIntentSentence({ mode = "ChainToCamp", scope = 1, locationSet = false, manageMovement = false, }), true, nil)
+        checkSentence("Intent BatchToCamp here solo",
+            Pull:BuildIntentSentence({ mode = "BatchToCamp", scope = 1, locationSet = false, manageMovement = false, }), true, nil)
 
         -- Camp family: remote camp, solo travel or managed escort
         checkSentence("Intent PullToCamp remote solo",

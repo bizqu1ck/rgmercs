@@ -2050,7 +2050,7 @@ function Casting.UseSpell(spellName, targetId, bAllowMem, bAllowDead, retryCount
     -- Expose this if needed for EZServer if they have instant CD spells with 0 gcd
     local noRecast = false
 
-    Casting.RunCastLoop({
+    local castWaitCompleted = Casting.RunCastLoop({
         cmd = cmd,
         readyCheck = readyCheck,
         actionName = spellName,
@@ -2067,7 +2067,7 @@ function Casting.UseSpell(spellName, targetId, bAllowMem, bAllowDead, retryCount
         Logger.log_debug("UseSpell(): Retargeting previous target after spell use.")
         Targeting.SetTarget(oldTargetId, true)
     end
-    return Casting.CastSucceeded(readyCheck, noRecast), Casting.IsGroupSpell(spell.TargetType())
+    return castWaitCompleted and Casting.CastSucceeded(readyCheck, noRecast), Casting.IsGroupSpell(spell.TargetType())
 end
 
 --- Plays a bard song on a target.
@@ -2333,7 +2333,7 @@ function Casting.UseDisc(discSpell, targetId, fireAndForget)
     local cmd = string.format("/squelch /doability \"%s\"", discName)
     local readyCheck = function() return me.CombatAbilityReady(discName)() end
 
-    Casting.RunCastLoop({
+    local castWaitCompleted = Casting.RunCastLoop({
         cmd = cmd,
         readyCheck = readyCheck,
         actionName = discName,
@@ -2351,7 +2351,7 @@ function Casting.UseDisc(discSpell, targetId, fireAndForget)
         Targeting.SetTarget(oldTargetId, true)
     end
 
-    return Casting.CastSucceeded(readyCheck, false), Casting.IsGroupSpell(rankDisc.TargetType())
+    return castWaitCompleted and Casting.CastSucceeded(readyCheck, false), Casting.IsGroupSpell(rankDisc.TargetType())
 end
 
 function Casting.GetSpellRange(spell)
@@ -2408,7 +2408,7 @@ function Casting.RunCastLoop(opts)
     if castTime == 0 and not Casting.IsActiveDisc(actionName) and (opts.fireAndForget or mq.TLO.Window("CastingWindow").Open() or mq.TLO.Me.Casting()) then
         Core.DoCmd(cmd)
         Casting.SetLastCastResult(Globals.Constants.CastResults.CAST_SUCCESS)
-        return
+        return true
     end
 
     -- give a small delay for when we need to rely on an action changing to "not ready" to detect success, this is data from the server. values tested on laz/might numerous times
@@ -2435,11 +2435,11 @@ function Casting.RunCastLoop(opts)
         -- Active discs confirm via ActiveDisc.ID above and have no cast bar to wait on.
         if mq.TLO.Me.Casting() and not isActiveDisc then
             Logger.log_verbose("\ayRunCastLoop(): Started to cast: %s - waiting to finish", actionName)
-            Casting.WaitCastFinish(targetId, bAllowDead, spellRange, castTime)
+            if not Casting.WaitCastFinish(targetId, bAllowDead, spellRange, castTime) then return false end
         end
         if Globals.StopCast then
             Logger.log_verbose("\atRunCastLoop(): Canceled casting %s due to stopcast command.", actionName)
-            return
+            return false
         end
         mq.doevents()
         Events.DoEvents()
@@ -2451,6 +2451,7 @@ function Casting.RunCastLoop(opts)
         if not readyCheck() then break end
         if not Globals.Constants.CastRetriable:contains(resultName) then break end
     until retryCount < 0
+    return true
 end
 
 --- Activates an AA ability on a target.
@@ -2536,7 +2537,7 @@ function Casting.UseAA(aaName, targetId, bAllowDead, retryCount, fireAndForget)
     local noRecast = (aaAbility.MyReuseTime() or 0) == 0
     local readyCheck = function() return me.AltAbilityReady(aaName)() end
 
-    Casting.RunCastLoop({
+    local castWaitCompleted = Casting.RunCastLoop({
         cmd = cmd,
         readyCheck = readyCheck,
         actionName = aaName,
@@ -2554,7 +2555,7 @@ function Casting.UseAA(aaName, targetId, bAllowDead, retryCount, fireAndForget)
         Targeting.SetTarget(oldTargetId, true)
     end
 
-    return Casting.CastSucceeded(readyCheck, noRecast), Casting.IsGroupSpell(aaSpell.TargetType())
+    return castWaitCompleted and Casting.CastSucceeded(readyCheck, noRecast), Casting.IsGroupSpell(aaSpell.TargetType())
 end
 
 --- Fires a combat ability (e.g., Taunt, Kick) via /doability.
@@ -2668,7 +2669,7 @@ function Casting.UseItem(itemName, targetId, bAllowDead, retryCount, fireAndForg
     local noRecast = (item.Clicky() and (item.Clicky.TimerID() or 0) == 0) or false
     local readyCheck = function() return me.ItemReady(itemName)() end
 
-    Casting.RunCastLoop({
+    local castWaitCompleted = Casting.RunCastLoop({
         cmd = cmd,
         readyCheck = readyCheck,
         actionName = itemName,
@@ -2691,7 +2692,7 @@ function Casting.UseItem(itemName, targetId, bAllowDead, retryCount, fireAndForg
         Targeting.SetTarget(oldTargetId, true)
     end
 
-    return Casting.CastSucceeded(readyCheck, noRecast), Casting.IsGroupSpell(targetType)
+    return castWaitCompleted and Casting.CastSucceeded(readyCheck, noRecast), Casting.IsGroupSpell(targetType)
 end
 
 --- Ensures the character is in a castable state immediately before a cast: stands the player up if they are sitting, and closes the spellbook window if it is open.
@@ -2708,73 +2709,86 @@ function Casting.ActionPrep()
     end
 end
 
---- Polls Me.Casting every 20 ms until it clears, up to a timeout derived from cast time plus 20x ping plus 1 second. While waiting, StopCasts the spell if the target dies or leaves range (beyond 110% of spellRange); every 200 ms prods the pet to attack if combat is active and HP is below PetEngagePct; every 500 ms runs MA auto-target and tank aggro scans; prints a group message and force-stops if the timeout expires.
+--- Waits for an active cast to finish and returns false if RGMercs cancels it.
 --- @param targetId number|nil The target to check while waiting.
 --- @param bAllowDead boolean Whether to allow the target to be dead.
 --- @param spellRange number The max range of the spell.
 --- @param castTime number|nil The length of the spell's cast.
 function Casting.WaitCastFinish(targetId, bAllowDead, spellRange, castTime)
-    local maxWaitOrig = (castTime or 5000) + ((mq.TLO.EverQuest.Ping() * 20) + 1000)
-    local maxWait = maxWaitOrig
+    local me = mq.TLO.Me
+    local castingWindow = mq.TLO.Window("CastingWindow")
+    local ping = mq.TLO.EverQuest.Ping()
+    local baseCastTime = 0
+    local duration = castTime or 0
+    if duration <= 0 then
+        baseCastTime = me.Casting.CastTime() or 0
+        duration = baseCastTime > 0 and baseCastTime or 5000
+    end
+    local timeout = duration + math.max(ping or 0, 0) * 20 + 1000
+    local startedAt = Globals.GetTimeMS()
+    local nextPetCheck = 0
+    local nextTargetScan = 0
 
     -- A playing bard song keeps Me.Casting truthy with no cast window; don't count it as an in-flight cast.
-    while mq.TLO.Me.Casting() and (mq.TLO.Window("CastingWindow").Open() or not mq.TLO.Me.BardSongPlaying()) do
-        local currentCast = mq.TLO.Me.Casting()
+    while me.Casting() and (castingWindow.Open() or not me.BardSongPlaying()) do
         Logger.log_super_verbose("WaitCastFinish(): Waiting to Finish Casting...")
         mq.delay(20)
+
+        local currentCast = me.Casting()
+        if not currentCast or (not castingWindow.Open() and me.BardSongPlaying()) then break end
 
         if targetId and targetId > 0 then
             local target = mq.TLO.Spawn(targetId)
             if (not target or not target() or Targeting.TargetIsType("corpse", target)) and not bAllowDead then
                 mq.TLO.Me.StopCast()
                 Logger.log_debug("WaitCastFinish(): Canceled casting %s because target is dead or no longer exists.", currentCast)
-                return
+                return false
             elseif spellRange and target() and not Targeting.TargetIsMyself(target) and Targeting.GetTargetDistance(target) > (spellRange * 1.1) then --allow for slight movement in and out of range, if the target runs off, this is still easily triggered
                 mq.TLO.Me.StopCast()
                 Logger.log_debug("WaitCastFinish(): Canceled casting %s because spellTarget(%d, range %d) is out of spell range(%d)", currentCast, target.ID(),
                     Targeting.GetTargetDistance(), spellRange)
-                return
+                return false
             elseif target() and not Targeting.TargetIsMyself(target) and target.ID() ~= Targeting.GetTargetID() then
                 Logger.log_debug("WaitCastFinish(): Warning your spellTarget(%d) for %s is no longer your currentTarget(%d)", target.ID(), currentCast, Targeting.GetTargetID())
             end
         end
 
-        local currentWait = maxWaitOrig - maxWait
-        if currentWait % 200 == 0 then
+        local elapsed = Globals.GetTimeMS() - startedAt
+        if elapsed >= nextPetCheck then
+            nextPetCheck = elapsed + 200
             if Combat.DoCombatActions() and mq.TLO.Me.Pet.ID() > 0 and not mq.TLO.Me.Pet.Combat() and not string.find(mq.TLO.Me.Pet.CleanName() or "", "familiar") then --alleviate pets standing around at early levels where mob HPs are low and cast times are long
                 if Targeting.GetTargetPctHPs(Targeting.GetAutoTarget()) <= Config:GetSetting('PetEngagePct') then
                     Combat.PetAttack(Globals.AutoTargetID, true)
                 end
             end
         end
-        if currentWait % 500 == 0 then
+        if elapsed >= nextTargetScan then
+            nextTargetScan = elapsed + 500
             Casting.RescanCombatTargets()
         end
 
-        maxWait = maxWait - 20
-
-        if maxWait <= 0 then
+        if elapsed >= timeout and me.Casting() and (castingWindow.Open() or not me.BardSongPlaying()) then
             local msg = string.format("StuckGem Data::: %d - MaxWait - %d - Casting Window: %s - Assist Target ID: %d",
-                (mq.TLO.Me.Casting.ID() or -1), maxWaitOrig,
-                Strings.BoolToColorString(mq.TLO.Window("CastingWindow").Open()), Globals.AutoTargetID)
+                (me.Casting.ID() or -1), timeout, Strings.BoolToColorString(castingWindow.Open()), Globals.AutoTargetID)
 
-            Logger.log_debug(msg)
+            Logger.log_debug("%s - Reported Cast Time: %s - Base Cast Time Fallback: %d - Ping: %s", msg, tostring(castTime), baseCastTime, tostring(ping))
             Comms.PrintGroupMessage(msg)
 
             --Algarnote: Consider re-adding this, but i'm not sure this is the place where we need to be doing it (we are in the while casting loop here, i think gem freeze will have no casting active)
             --Core.DoCmd("/alt act 511")
             mq.TLO.Me.StopCast()
-            return
+            return false
         end
 
         if Globals.StopCast then
             mq.TLO.Me.StopCast()
-            return
+            return false
         end
 
         mq.doevents()
         Events.DoEvents()
     end
+    return true
 end
 
 --- Polls Me.SpellReady every 20 ms until the spell's gem timer has cleared or maxWait (ms) expires; aborts early if combat begins or if the spell leaves the player's book due to a persona change. Adds a ping-scaled delay after the spell becomes ready to account for server lag.

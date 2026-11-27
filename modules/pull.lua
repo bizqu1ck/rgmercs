@@ -67,6 +67,7 @@ Module.TempSettings.CurrentWPName         = nil
 Module.TempSettings.CurrentWPIndex        = 1
 Module.TempSettings.ReachedWP             = false
 Module.TempSettings.CircuitSkips          = 0
+Module.TempSettings.CircuitTravelBackoff = false
 
 -- Camp Travel & Escort
 Module.TempSettings.CampTravelLoc         = nil
@@ -193,6 +194,7 @@ for k, v in pairs(Module.Constants.PullFilterReasons) do Module.Constants.PullFi
 Module.Constants.PullModes          = {
     "PullToCamp",
     "ChainToCamp",
+    "BatchToCamp",
     "AreaHunt",
     "RoamingHunt",
     "CircuitHunt",
@@ -202,6 +204,7 @@ Module.Constants.PullModes          = {
 Module.Constants.PullModeDisplays   = {
     "Pull to Camp",
     "Chain to Camp",
+    "Batch to Camp",
     "Area Hunt",
     "Roaming Hunt",
     "Circuit Hunt",
@@ -211,6 +214,7 @@ Module.Constants.PullModeDisplays   = {
 Module.Constants.PullModePolicies   = {
     ['PullToCamp']  = { family = 'camp', hasObjective = true, runsDuringCombat = false, successCheck = 'any', rescanToCloser = true, scanCenter = 'self', radiusSetting = 'PullRadius', },
     ['ChainToCamp'] = { family = 'camp', hasObjective = true, runsDuringCombat = true, successCheck = 'chainCount', rescanToCloser = true, scanCenter = 'self', radiusSetting = 'PullRadius', },
+    ['BatchToCamp'] = { family = 'camp', hasObjective = true, runsDuringCombat = true, successCheck = 'batchCount', rescanToCloser = true, scanCenter = 'self', radiusSetting = 'PullRadius', },
     ['AreaHunt']    = { family = 'hunt', hasObjective = true, runsDuringCombat = false, successCheck = 'any', rescanToCloser = true, scanCenter = 'anchor', radiusSetting = 'PullRadiusHunt', },
     ['RoamingHunt'] = { family = 'hunt', hasObjective = false, runsDuringCombat = false, successCheck = 'any', rescanToCloser = true, scanCenter = 'self', radiusSetting = 'PullRadiusHunt', },
     ['CircuitHunt'] = { family = 'hunt', hasObjective = false, runsDuringCombat = false, successCheck = 'any', rescanToCloser = true, scanCenter = 'waypoint', radiusSetting = 'PullRadiusHunt', },
@@ -405,6 +409,11 @@ local PullStates                    = Module.Constants.PullStates -- hot-path al
 
 Module.TempSettings.PullState       = PullStates.PULL_IDLE
 Module.TempSettings.PullStateReason = ""
+Module.TempSettings.BatchPullComplete = false
+Module.TempSettings.BatchCollecting = false
+Module.TempSettings.BatchPeersPaused = false
+Module.TempSettings.BatchPausedPeers = {}
+Module.TempSettings.BatchReturnBackoff = false
 
 Module.Constants.PullStateHandlers  = {
     [PullStates.PULL_IDLE]               = 'PreAttemptTick',
@@ -450,9 +459,10 @@ Module.DefaultConfig                = {
         Answer = "You can adjust Pull Modes on the Pull module tab.\n\n" ..
             "Pull to Camp: Attempt to pull single mobs back to a static camp location. Starting pulls camps you where you stand, or at a staged travel destination, unless a camp is already set.\n\n" ..
             "Chain to Camp: Continuously pull single mobs back to a static camp location until the chain count has been reached. The camp is set the same way as Pull to Camp.\n\n" ..
+            "Batch to Camp: Collect mobs away from camp until the batch count has been reached, then return and release group engagement. If fewer valid mobs are available, return with the partial batch.\n\n" ..
             "Area Hunt: Move from target to target within a defined circular area, fighting as you go. Optionally, set a hunt origin to travel to and hunt from.\n\n" ..
             "Roaming Hunt: Hunt around your current position, drifting as you fight.\n\n" ..
-            "Circuit Hunt: Move between your enabled Pull Locations, hunting mobs in a defined radius from each.\n\n" ..
+            "Circuit Hunt: Move between your enabled Pull Locations, hunting mobs in a defined radius from each. With Ignore Aggro While Traveling enabled, the puller keeps navigating and does not auto-engage until it reaches the next location.\n\n" ..
             "Fight To: Travel to a chosen target or location, fighting anything that aggros along the way.",
     },
     ['FarmWayPoints']                          = {
@@ -599,6 +609,24 @@ Module.DefaultConfig                = {
         Min = 0,
         Max = 3000,
     },
+    ['CircuitIgnoreAggro']                    = {
+        DisplayName = "Ignore Aggro While Traveling",
+        Group = "Movement",
+        Header = "Pulling",
+        Category = "Pull Rules",
+        Index = 2.5,
+        Tooltip = "Circuit Hunt mode: keep navigating between Pull Locations without engaging mobs that aggro before arrival.",
+        Default = true,
+    },
+    ['CircuitSingleLap']                       = {
+        DisplayName = "Single Lap",
+        Group = "Movement",
+        Header = "Pulling",
+        Category = "Pull Rules",
+        Index = 2.6,
+        Tooltip = "Circuit Hunt mode: stop pulling after the last enabled Pull Location is finished instead of looping back to the first.",
+        Default = false,
+    },
     ['AutoSetRoles']                           = {
         DisplayName = "Auto Set Group Roles",
         Group = "Movement",
@@ -664,12 +692,23 @@ Module.DefaultConfig                = {
         Min = 1,
         Max = mq.TLO.Me.XTargetSlots() or 20,
     },
+    ['BatchCount']                             = {
+        DisplayName = "Batch Count",
+        Group = "Movement",
+        Header = "Pulling",
+        Category = "Pull Rules",
+        Index = 8,
+        Tooltip = "Batch to Camp mode: The number of haters on xtarget to gather before returning to camp.",
+        Default = 3,
+        Min = 1,
+        Max = mq.TLO.Me.XTargetSlots() or 20,
+    },
     ['PullIgnoreTime']                         = {
         DisplayName = "Ignore Timer",
         Group = "Movement",
         Header = "Pulling",
         Category = "Pull Rules",
-        Index = 8,
+        Index = 9,
         Tooltip = "How long we will attempt to pull a target before adding it to an ignore list.",
         Default = 15,
         Min = 5,
@@ -685,7 +724,7 @@ Module.DefaultConfig                = {
         Group = "Movement",
         Header = "Pulling",
         Category = "Pull Rules",
-        Index = 9,
+        Index = 11,
         Tooltip = "Disable pulling when you die; if unchecked, pulls resume when you return near your camp or the spot you died.",
         Default = true,
         ConfigType = "Advanced",
@@ -982,10 +1021,10 @@ Module.CommandHandlers              = {
         end,
     },
     pullmode = {
-        usage = "/rgl pullmode <camp|chain|area|roam|circuit|fightto>",
+        usage = "/rgl pullmode <camp|chain|batch|area|roam|circuit|fightto>",
         about = "Sets the Pull Mode. The full mode names (PullToCamp, AreaHunt, etc) are also accepted.",
         handler = function(self, mode)
-            local friendlyNames = { camp = "PullToCamp", chain = "ChainToCamp", area = "AreaHunt", roam = "RoamingHunt", circuit = "CircuitHunt", fightto = "FightTo", }
+            local friendlyNames = { camp = "PullToCamp", chain = "ChainToCamp", batch = "BatchToCamp", area = "AreaHunt", roam = "RoamingHunt", circuit = "CircuitHunt", fightto = "FightTo", }
             local modeArg = tostring(mode or ""):lower()
             local newMode = friendlyNames[modeArg]
             if not newMode then
@@ -994,7 +1033,7 @@ Module.CommandHandlers              = {
                 end
             end
             if not newMode then
-                Logger.log_error("/rgl pullmode - '%s' is not a pull mode (use camp, chain, area, roam, circuit or fightto).", tostring(mode))
+                Logger.log_error("/rgl pullmode - '%s' is not a pull mode (use camp, chain, batch, area, roam, circuit or fightto).", tostring(mode))
                 return true
             end
             self:SetPullMode(newMode)
@@ -1490,6 +1529,24 @@ function Module:SetPullMode(newMode)
     Config:SetSetting('PullMode', newMode)
 end
 
+function Module:IsCircuitAggroIgnored()
+    return self:IsPullMode("CircuitHunt") and Config:GetSetting('CircuitIgnoreAggro')
+end
+
+function Module:SetCircuitTravelBackoff(enabled)
+    if enabled then
+        if not Globals.BackOffFlag then
+            Globals.BackOffFlag = true
+            self.TempSettings.CircuitTravelBackoff = true
+            Logger.log_debug("PULL: Circuit travel backoff enabled.")
+        end
+    elseif self.TempSettings.CircuitTravelBackoff then
+        Globals.BackOffFlag = false
+        self.TempSettings.CircuitTravelBackoff = false
+        Logger.log_debug("PULL: Circuit travel backoff cleared; combat may engage.")
+    end
+end
+
 ---@param mode string
 ---@return boolean
 function Module:IsPullMode(mode)
@@ -1497,6 +1554,10 @@ function Module:IsPullMode(mode)
 end
 
 function Module:OnPullModeChanged()
+    self:ReleaseBatchPeers()
+    self:SetCircuitTravelBackoff(false)
+    self.TempSettings.BatchCollecting = false
+    self.TempSettings.BatchPullComplete = false
     if self:GetModePolicy().family ~= 'camp' and (self.TempSettings.EscortScopeWord or self.TempSettings.CampTravelLoc) then
         self:ClearEscortState()
         self.TempSettings.CampTravelLoc = nil
@@ -1511,9 +1572,65 @@ function Module:OnPullModeChanged()
 end
 
 -- Pure Decision Helpers (unit-tested)
-function Module:PullSuccessCheck(successCheck, xtHaterCount, chainCount)
-    if successCheck == 'chainCount' then return xtHaterCount >= chainCount end
+function Module:PullSuccessCheck(successCheck, xtHaterCount, targetCount)
+    if successCheck == 'chainCount' or successCheck == 'batchCount' then return xtHaterCount >= targetCount end
     return xtHaterCount > 0
+end
+
+function Module:GetPullTargetCount(policy)
+    if policy.successCheck == 'chainCount' then return Config:GetSetting('ChainCount') end
+    if policy.successCheck == 'batchCount' then return Config:GetSetting('BatchCount') end
+    return 1
+end
+
+function Module:ShouldContinueBatchCollection(batchComplete, userStopped, abortReason)
+    return not batchComplete and not userStopped and not abortReason
+end
+
+function Module:PauseBatchPeers()
+    if self.TempSettings.BatchPeersPaused then return end
+
+    self.TempSettings.BatchPausedPeers = {}
+    for _, peer in ipairs(self:GroupOrRaidPeers(false)) do
+        if not peer.data or peer.data.State ~= "Paused" then
+            table.insert(self.TempSettings.BatchPausedPeers, peer.key)
+        end
+    end
+
+    for _, peerKey in ipairs(self.TempSettings.BatchPausedPeers) do
+        Comms.SendPeerDoCmd(peerKey, "/rgl pause")
+    end
+    self.TempSettings.BatchPeersPaused = true
+    Logger.log_debug("PULL: Batch peer pause requested for %d peer(s); waiting for acknowledgements before pulling.",
+        #self.TempSettings.BatchPausedPeers)
+end
+
+function Module:BatchPeersReady()
+    if not self.TempSettings.BatchPeersPaused then return true end
+
+    for _, peerKey in ipairs(self.TempSettings.BatchPausedPeers) do
+        local heartbeat = Comms.GetPeerHeartbeat(peerKey)
+        if not heartbeat.LastHeartbeat or (Globals.GetTimeSeconds() - heartbeat.LastHeartbeat) > 2
+            or not heartbeat.Data or heartbeat.Data.State ~= "Paused" then
+            return false
+        end
+    end
+    return true
+end
+
+function Module:ReleaseBatchPeers()
+    if self.TempSettings.BatchPeersPaused then
+        for _, peerKey in ipairs(self.TempSettings.BatchPausedPeers) do
+            Comms.SendPeerDoCmd(peerKey, "/rgl unpause")
+        end
+        self.TempSettings.BatchPausedPeers = {}
+        self.TempSettings.BatchPeersPaused = false
+    end
+
+    if self.TempSettings.BatchReturnBackoff then
+        Globals.BackOffFlag = false
+        self.TempSettings.BatchReturnBackoff = false
+    end
 end
 
 function Module:DecideUserAbort(abortCtx, source)
@@ -1558,8 +1675,8 @@ function Module:BuildIntentSentence(params)
     end
     local joiner = (params.breakCamp or params.manageMovement) and "then " or ""
 
-    if params.mode == "PullToCamp" or params.mode == "ChainToCamp" then
-        local action = params.mode == "ChainToCamp" and "chain-pull to camp" or "pull to camp"
+    if params.mode == "PullToCamp" or params.mode == "ChainToCamp" or params.mode == "BatchToCamp" then
+        local action = params.mode == "ChainToCamp" and "chain-pull to camp" or params.mode == "BatchToCamp" and "batch-pull to camp" or "pull to camp"
         if params.locationSet then
             if params.manageMovement then
                 text = pre .. string.format("travel to %s, set camp for everyone on arrival, then %s.", self:FormatLoc(params.loc), action)
@@ -1568,7 +1685,7 @@ function Module:BuildIntentSentence(params)
             end
         else
             if params.existingCamp then
-                text = string.format("I'll %s to my existing camp.", params.mode == "ChainToCamp" and "chain-pull" or "pull")
+                text = string.format("I'll %s to my existing camp.", params.mode == "ChainToCamp" and "chain-pull" or params.mode == "BatchToCamp" and "batch-pull" or "pull")
             elseif params.manageMovement then
                 text = string.format("I'll set camp for myself and my %s peers here, then %s.", scopeWord, action)
             else
@@ -2186,6 +2303,15 @@ function Module:Render()
                 ImGui.EndDisabled()
                 ImGui.EndGroup()
                 if locked then Ui.Tooltip("Stop pulls to add a location from your position or target.") end
+                local singleLap = Config:GetSetting('CircuitSingleLap')
+                local newSingleLap = ImGui.Checkbox("Single Lap", singleLap)
+                if newSingleLap ~= singleLap then Config:SetSetting('CircuitSingleLap', newSingleLap) end
+                Ui.Tooltip(Config:GetSettingDefaults('CircuitSingleLap').Tooltip)
+                ImGui.SameLine()
+                local ignoreAggro = Config:GetSetting('CircuitIgnoreAggro')
+                local newIgnoreAggro = ImGui.Checkbox("Ignore Aggro While Traveling", ignoreAggro)
+                if newIgnoreAggro ~= ignoreAggro then Config:SetSetting('CircuitIgnoreAggro', newIgnoreAggro) end
+                Ui.Tooltip(Config:GetSettingDefaults('CircuitIgnoreAggro').Tooltip)
 
                 local zoneLocations = self:GetZoneLocations()
                 local style = ImGui.GetStyle()
@@ -2405,11 +2531,12 @@ function Module:Render()
                     end
                 end
             end
-            if self:IsPullMode("ChainToCamp") then
+            if self:IsPullMode("ChainToCamp") or self:IsPullMode("BatchToCamp") then
                 ImGui.TableNextColumn()
-                Ui.RenderText("Chain Progress")
+                Ui.RenderText(self:IsPullMode("BatchToCamp") and "Batch Progress" or "Chain Progress")
                 ImGui.TableNextColumn()
-                Ui.RenderText(string.format("%d / %d", Targeting.GetXTHaterCount(), Config:GetSetting('ChainCount')))
+                Ui.RenderText(string.format("%d / %d", Targeting.GetXTHaterCount(),
+                    self:IsPullMode("BatchToCamp") and Config:GetSetting('BatchCount') or Config:GetSetting('ChainCount')))
             end
             if Config:GetSetting('PullBuffCount') > 0 then
                 ImGui.TableNextColumn()
@@ -3299,10 +3426,29 @@ end
 function Module:TravelTick(ctx, loc, reason, circuitWpId)
     local travel = self.TempSettings.Travel
     local navActive = mq.TLO.Navigation.Active()
+    local ignoreCircuitAggro = circuitWpId and self:IsCircuitAggroIgnored()
+    if ignoreCircuitAggro then self:SetCircuitTravelBackoff(true) end
     local navSpent = travel and travel.navStarted and not navActive
     local arrivalSquared = Math.GetDistanceSquared(mq.TLO.Me.X(), mq.TLO.Me.Y(), loc.x, loc.y)
     if loc.z and not navSpent then arrivalSquared = arrivalSquared + (loc.z - mq.TLO.Me.Z()) ^ 2 end
-    if arrivalSquared <= 2500 then
+    if circuitWpId then
+        Logger.log_super_verbose(
+            "PULL: Circuit waypoint %d position y=%.1f x=%.1f z=%.1f target y=%.1f x=%.1f z=%.1f distance=%.1f navActive=%s velocity=%.1f",
+            circuitWpId, mq.TLO.Me.Y(), mq.TLO.Me.X(), mq.TLO.Me.Z(), loc.y, loc.x, loc.z or mq.TLO.Me.Z(),
+            math.sqrt(arrivalSquared), tostring(navActive), mq.TLO.Navigation.Velocity() or 0)
+    end
+    local stoppedNearCircuitWaypoint = circuitWpId and navActive and (mq.TLO.Navigation.Velocity() or 0) <= 0 and arrivalSquared <= 10000
+    if arrivalSquared <= 2500 or stoppedNearCircuitWaypoint then
+        if stoppedNearCircuitWaypoint then
+            Logger.log_debug("PULL: Circuit waypoint %d nav is stopped within 100 units; treating the waypoint as reached.", circuitWpId)
+        end
+        if navActive then
+            Movement:DoNav(false, "stop log=off")
+        end
+        if ignoreCircuitAggro then
+            self:SetCircuitTravelBackoff(false)
+            Logger.log_debug("PULL: Circuit reached Pull Location %d; auto-engagement restored.", circuitWpId)
+        end
         self.TempSettings.Travel = nil
         return 'arrived'
     end
@@ -3314,7 +3460,7 @@ function Module:TravelTick(ctx, loc, reason, circuitWpId)
 
     self:SetPullState(PullStates.PULL_MOVING_TO_WP, reason)
 
-    if Targeting.HasXTHaters() then
+    if Targeting.HasXTHaters() and not ignoreCircuitAggro then
         if mq.TLO.Navigation.Active() then
             Movement:DoNav(false, "stop log=off")
         end
@@ -3325,6 +3471,7 @@ function Module:TravelTick(ctx, loc, reason, circuitWpId)
 
     if self.TempSettings.PausePulls or not Config:GetSetting('DoPull') or Globals.PauseMain then
         Movement:DoNav(false, "stop log=off")
+        if ignoreCircuitAggro then self:SetCircuitTravelBackoff(false) end
         self.TempSettings.Travel = nil
         return 'aborted'
     end
@@ -3351,6 +3498,10 @@ function Module:TravelTick(ctx, loc, reason, circuitWpId)
         if ctx.now - travel.navIssuedAt < 1000 then return 'moving' end
         self.TempSettings.Travel = nil
         if circuitWpId then
+            if ignoreCircuitAggro then
+                self:SetCircuitTravelBackoff(false)
+                Logger.log_debug("PULL: Circuit waypoint %d nav ended short of the location; auto-engagement restored until travel resumes.", circuitWpId)
+            end
             Logger.log_verbose("PULL:TravelTick Waypoint: Nav ended early. Current distance to WP: %d. (Nav %s.)",
                 mq.TLO.Math.Distance(self:FormatLoc(loc))(), self.TempSettings.NavUnreachable and "reported no path" or "was interrupted")
             return 'fail', self.TempSettings.NavUnreachable
@@ -3512,12 +3663,23 @@ function Module:ShouldPull(campData)
 
     local haterCount = Targeting.GetXTHaterCount()
 
-    if policy.successCheck == 'chainCount' and haterCount >= Config:GetSetting('ChainCount') then
-        Logger.log_verbose("\ay::PULL:: \arAborted!\ax XTargetCount(%d) >= ChainCount(%d)", haterCount, Config:GetSetting('ChainCount'))
-        return false, string.format("XTargetCount(%d) > ChainCount(%d)", haterCount, Config:GetSetting('ChainCount'))
+    if policy.successCheck == 'chainCount' or policy.successCheck == 'batchCount' then
+        local targetCount = self:GetPullTargetCount(policy)
+        if policy.successCheck == 'batchCount' and self.TempSettings.BatchPullComplete then
+            if haterCount == 0 then
+                self.TempSettings.BatchPullComplete = false
+            else
+                return false, "Batch complete - waiting for XTarget to clear"
+            end
+        end
+        if haterCount >= targetCount then
+            if policy.successCheck == 'batchCount' then self.TempSettings.BatchPullComplete = true end
+            Logger.log_verbose("\ay::PULL:: \arAborted!\ax XTargetCount(%d) >= TargetCount(%d)", haterCount, targetCount)
+            return false, string.format("XTargetCount(%d) >= TargetCount(%d)", haterCount, targetCount)
+        end
     end
 
-    if policy.successCheck ~= 'chainCount' and haterCount > 0 then
+    if policy.successCheck == 'any' and haterCount > 0 then
         Logger.log_verbose("\ay::PULL:: \arAborted!\ax XTargetCount(%d) > 0", haterCount)
         return false, string.format("XTargetCount(%d) > 0", haterCount)
     end
@@ -3608,7 +3770,7 @@ function Module:CheckGroupForPull(resourceResumePct, resourcePausePct, campData,
                 end
             end
 
-            if Config:GetSetting('PullMode') == "ChainToCamp" then
+            if Config:GetSetting('PullMode') == "ChainToCamp" or Config:GetSetting('PullMode') == "BatchToCamp" then
                 if member.ID() == Core.GetMainAssistId() then
                     if campData.returnToCamp and Math.GetDistanceSquared(member.X(), member.Y(), campData.campSettings.AutoCampX, campData.campSettings.AutoCampY) > maxDist then
                         self:Announce(member.CleanName(), string.format("Assist Target is beyond AutoCampRadius from %d, %d, %d : %d. Holding pulls.",
@@ -3682,7 +3844,7 @@ function Module:CheckPeersForPull(resourceResumePct, resourcePausePct, campData,
                     end
                 end
 
-                if Config:GetSetting('PullMode') == "ChainToCamp" and data.X and data.Y then
+                if (Config:GetSetting('PullMode') == "ChainToCamp" or Config:GetSetting('PullMode') == "BatchToCamp") and data.X and data.Y then
                     if name == Globals.MainAssist then
                         if campData.returnToCamp and Math.GetDistanceSquared(data.X, data.Y, campData.campSettings.AutoCampX, campData.campSettings.AutoCampY) > maxDist then
                             self:Announce(name, string.format("Assist Target is beyond AutoCampRadius from %d, %d, %d : %d. Holding pulls.",
@@ -3801,7 +3963,7 @@ function Module:GetPullableSpawns()
             return false
         end
 
-        if policy.successCheck == 'chainCount' then
+        if policy.successCheck == 'chainCount' or policy.successCheck == 'batchCount' then
             if Targeting.IsSpawnXTHater(spawn.ID()) then
                 Logger.log_verbose("\atPULL::FindPullTarget \awSpawn \am%s\aw (\at%d\aw) \aoAlready on XTarget -- Skipping", spawnName, spawn.ID())
                 recordReason(spawn, reasons.ON_XTARGET)
@@ -4057,6 +4219,25 @@ end
 function Module:RunEntryGates(ctx)
     self:ProcessDeleteLocations()
 
+    -- The option can be switched off mid-travel; never leave our travel backoff behind.
+    if not self:IsCircuitAggroIgnored() then self:SetCircuitTravelBackoff(false) end
+
+    -- Ignore-aggro circuit travel must keep ticking through aggro: the combat and ShouldPull gates below all stop on XTarget haters.
+    if ctx.policy.scanCenter == 'waypoint' and self.TempSettings.Travel and self:IsCircuitAggroIgnored()
+        and (ctx.combatState ~= "Downtime" or Targeting.HasXTHaters()) then
+        local wpId = self:GetCurrentWpId()
+        if wpId == 0 then
+            self:SetCircuitTravelBackoff(false)
+            self.TempSettings.Travel = nil
+            return false
+        end
+        local result, unreachable = self:TravelTick(ctx, self:GetWPById(wpId), string.format("WP Id: %d", wpId), wpId)
+        Logger.log_debug("PULL: Circuit waypoint %d travel (through aggro) result=%s unreachable=%s haters=%d backoff=%s",
+            wpId, result, tostring(unreachable), Targeting.GetXTHaterCount(), tostring(Globals.BackOffFlag))
+        self:HandleCircuitTravelResult(result, unreachable, wpId)
+        return false
+    end
+
     if ctx.combatState ~= "Downtime" and not ctx.policy.runsDuringCombat then
         Logger.log_verbose("PULL:GiveTime() we are in %s, not ready for pulling.", ctx.combatState)
         return false
@@ -4088,6 +4269,7 @@ function Module:RunEntryGates(ctx)
     end
 
     if not Config:GetSetting('DoPull') then
+        self:SetCircuitTravelBackoff(false)
         if self.TempSettings.HuntAnchor then
             self.TempSettings.HuntAnchor = nil
             Core.DoCmd("/mapfilter pullradius off")
@@ -4202,7 +4384,7 @@ function Module:PreAttemptTick(ctx)
 
         if self.TempSettings.PullState == PullStates.PULL_NAV_INTERRUPT or self.TempSettings.Travel then
             -- if we still have haters let combat handle it first.
-            if Targeting.HasXTHaters() then
+            if Targeting.HasXTHaters() and not self:IsCircuitAggroIgnored() then
                 return
             end
 
@@ -4210,6 +4392,8 @@ function Module:PreAttemptTick(ctx)
             local advanceLeg = self.TempSettings.Travel and self.TempSettings.Travel.circuitAdvance
             local wpData = self:GetWPById(currentWpId)
             local result, unreachable = self:TravelTick(ctx, wpData, string.format("WP Id: %d", currentWpId), currentWpId)
+            Logger.log_debug("PULL: Circuit waypoint %d travel result=%s unreachable=%s haters=%d backoff=%s",
+                currentWpId, result, tostring(unreachable), Targeting.GetXTHaterCount(), tostring(Globals.BackOffFlag))
             self:HandleCircuitTravelResult(result, unreachable, currentWpId)
             if result ~= 'arrived' then return end
             if advanceLeg then return end
@@ -4365,6 +4549,11 @@ function Module:PreAttemptTick(ctx)
             return
         end
     else
+        -- With ignore-aggro travel, get to the Pull Location before scanning; otherwise the scan (centered on the location) sends us straight at the nearest mob.
+        if ctx.policy.scanCenter == 'waypoint' and not self.TempSettings.ReachedWP and self:IsCircuitAggroIgnored() then
+            self:CircuitAdvanceTick(ctx)
+            return
+        end
         Logger.log_debug("PULL:Finding Pull Target")
         pullID = self:FindTarget()
     end
@@ -4375,6 +4564,10 @@ function Module:PreAttemptTick(ctx)
     end
 
     if pullID == 0 then
+        if ctx.policy.successCheck == 'batchCount' and self.TempSettings.BatchCollecting then
+            self:BeginBatchReturn(ctx, "No more valid targets")
+            return
+        end
         self:SetPullState(PullStates.PULL_IDLE, string.format("No pullable targets within %d units", Config:GetSetting(ctx.policy.radiusSetting)))
         Logger.log_debug("\ayNothing to pull - better luck next time")
         return
@@ -4401,11 +4594,21 @@ function Module:HandleCircuitTravelResult(result, unreachable, wpId)
             return
         end
         Logger.log_error("\arPull location \at%s\ar could not be reached - skipping it this lap.", self:GetWPById(wpId).name or "Unknown")
+        if self:FinishCircuitLap(wpId) then return end
         self:IncrementWpId()
     elseif result == 'aggro' then
         self:SetPullState(PullStates.PULL_NAV_INTERRUPT, "")
         self.TempSettings.ReachedWP = false
     end
+end
+
+--- Single Lap: stops pulls once the last enabled Pull Location is done, leaving the circuit rewound to the first.
+function Module:FinishCircuitLap(wpId)
+    if not Config:GetSetting('CircuitSingleLap') or wpId < #self:GetEnabledLocations() then return false end
+    self:IncrementWpId()
+    self.TempSettings.ReachedWP = false
+    self:AnnounceStop("Circuit complete - pulls disabled.", false, true)
+    return true
 end
 
 function Module:CircuitAdvanceTick(ctx)
@@ -4417,6 +4620,7 @@ function Module:CircuitAdvanceTick(ctx)
                 Config:GetSetting('WaypointDelay') - (Globals.GetTimeSeconds() - self.TempSettings.LastPullOrCombatEnded))
             return
         end
+        if self:FinishCircuitLap(self:GetCurrentWpId()) then return end
         self:IncrementWpId()
         self.TempSettings.ReachedWP = false
     end
@@ -4437,6 +4641,16 @@ end
 
 function Module:OpenAttempt(ctx, pullID, source)
     self.TempSettings.Travel = nil
+
+    if ctx.policy.successCheck == 'batchCount' and not self.TempSettings.BatchCollecting then
+        self.TempSettings.BatchCollecting = true
+        self:PauseBatchPeers()
+    end
+
+    if ctx.policy.successCheck == 'batchCount' and not self:BatchPeersReady() then
+        self:SetPullState(PullStates.PULL_SCAN, "Waiting for group to pause before batch pull")
+        return
+    end
 
     local start_x = mq.TLO.Me.X()
     local start_y = mq.TLO.Me.Y()
@@ -4489,19 +4703,57 @@ function Module:OpenAttempt(ctx, pullID, source)
     }
 end
 
+function Module:ContinueBatchCollection(ctx)
+    Core.StopAttack()
+    self.TempSettings.TargetSpawnID = 0
+    self.TempSettings.Attempt = nil
+    self:SetPullState(PullStates.PULL_SCAN,
+        string.format("Collecting batch: %d / %d", Targeting.GetXTHaterCount(), self:GetPullTargetCount(ctx.policy)))
+end
+
+function Module:BeginBatchReturn(ctx, reason)
+    self.TempSettings.BatchPullComplete = true
+
+    local attempt = self.TempSettings.Attempt
+    if not attempt then
+        local campSettings = ctx.campData.campSettings
+        attempt = {
+            targetId = 0,
+            source = 'scan',
+            policy = ctx.policy,
+            returnLoc = { y = campSettings.AutoCampY, x = campSettings.AutoCampX, z = campSettings.AutoCampZ, },
+        }
+        self.TempSettings.Attempt = attempt
+    end
+
+    local returnLoc = attempt.returnLoc
+    Logger.log_debug("PULL: Batch collected (%d/%d); returning to camp: %s",
+        Targeting.GetXTHaterCount(), self:GetPullTargetCount(ctx.policy), reason or "batch ready")
+    Core.StopAttack()
+    if not Globals.BackOffFlag then
+        Globals.BackOffFlag = true
+        self.TempSettings.BatchReturnBackoff = true
+    end
+    self:SetPullState(PullStates.PULL_RETURN_TO_CAMP,
+        string.format("Batch return: %s", reason or "batch ready"))
+    Movement:DoNav(false, "locyxz %0.2f %0.2f %0.2f log=off %s", returnLoc.y, returnLoc.x, returnLoc.z,
+        Config:GetSetting('PullBackwards') and "facing=backward" or "")
+    attempt.returnNavIssuedAt = ctx.now
+end
+
 function Module:NavToTargetTick(ctx)
     local attempt = self.TempSettings.Attempt
 
     if mq.TLO.Navigation.Active() then
         Logger.log_super_verbose("Pathing to pull id...")
-        if ctx.policy.successCheck == 'chainCount' then
-            if Targeting.HasXTHaters(Config:GetSetting('ChainCount')) then
-                Logger.log_debug("\awNOTICE:\ax Gained aggro -- aborting chain pull!")
+        if ctx.policy.successCheck == 'chainCount' or ctx.policy.successCheck == 'batchCount' then
+            if Targeting.HasXTHaters(self:GetPullTargetCount(ctx.policy)) then
+                Logger.log_debug("\awNOTICE:\ax Gained aggro -- aborting count pull!")
                 self:AbortNavToTarget(ctx)
                 return
             end
             if Targeting.DiffXTHaterIDs(attempt.startingXTargs) then
-                Logger.log_debug("\awNOTICE:\ax XTarget List Changed -- aborting chain pull!")
+                Logger.log_debug("\awNOTICE:\ax XTarget List Changed -- aborting count pull!")
                 self:AbortNavToTarget(ctx)
                 return
             end
@@ -4629,7 +4881,7 @@ function Module:PullingTick(ctx)
         end
     end
 
-    if self:PullSuccessCheck(ctx.policy.successCheck, Targeting.GetXTHaterCount(), Config:GetSetting('ChainCount')) then
+    if self:PullSuccessCheck(ctx.policy.successCheck, Targeting.GetXTHaterCount(), self:GetPullTargetCount(ctx.policy)) then
         self:EndEngage(ctx)
         return
     end
@@ -4677,7 +4929,7 @@ function Module:PullingTick(ctx)
         descriptor.action(self, attempt)
     end
 
-    if ctx.policy.successCheck == 'chainCount' and Targeting.DiffXTHaterIDs(attempt.startingXTargs) then
+    if (ctx.policy.successCheck == 'chainCount' or ctx.policy.successCheck == 'batchCount') and Targeting.DiffXTHaterIDs(attempt.startingXTargs) then
         if descriptor.chainBreakLog then
             Logger.log_debug("PULL:\arXtargs changed heading back to camp!")
         end
@@ -4706,7 +4958,8 @@ function Module:EndEngage(ctx)
         Core.DoCmd("/squelch /pet follow")
     end
 
-    if self:PullSuccessCheck(ctx.policy.successCheck, Targeting.GetXTHaterCount(), Config:GetSetting('ChainCount')) then
+    if self:PullSuccessCheck(ctx.policy.successCheck, Targeting.GetXTHaterCount(), self:GetPullTargetCount(ctx.policy)) then
+        if ctx.policy.successCheck == 'batchCount' then self.TempSettings.BatchPullComplete = true end
         Globals.LastPulledID = attempt.targetId
     end
 
@@ -4715,11 +4968,26 @@ end
 
 function Module:TransitionAfterEngage(ctx)
     local attempt = self.TempSettings.Attempt
+    if ctx.policy.successCheck == 'batchCount' and Targeting.GetXTHaterCount() >= self:GetPullTargetCount(ctx.policy) then
+        self.TempSettings.BatchPullComplete = true
+    end
     local userStopped = self:DecideUserAbort({
         pausePulls = self.TempSettings.PausePulls,
         doPull = Config:GetSetting('DoPull'),
         pauseMain = Globals.PauseMain,
     }, attempt.source)
+
+    if ctx.policy.successCheck == 'batchCount' and self.TempSettings.BatchCollecting then
+        Logger.log_debug("PULL: Batch transition: xtarget=%d/%d complete=%s abort=%s",
+            Targeting.GetXTHaterCount(), self:GetPullTargetCount(ctx.policy),
+            tostring(self.TempSettings.BatchPullComplete), attempt.abortReason or "none")
+        if self:ShouldContinueBatchCollection(self.TempSettings.BatchPullComplete, userStopped, attempt.abortReason) then
+            self:ContinueBatchCollection(ctx)
+        else
+            self:BeginBatchReturn(ctx, userStopped and "Pulling stopped" or attempt.abortReason or "batch ready")
+        end
+        return
+    end
 
     if ctx.policy.family == 'camp' and not userStopped then
         -- Nav back to camp.
@@ -4740,6 +5008,10 @@ function Module:ReturnToCampTick(ctx)
     if self:CheckUserAbort(attempt) then
         Movement:DoNav(false, "stop log=off")
         mq.delay("2s", function() return not mq.TLO.Navigation.Active() end)
+        if ctx.policy.successCheck == 'batchCount' then
+            self:ReleaseBatchPeers()
+            self.TempSettings.BatchCollecting = false
+        end
         self:CloseAttempt(ctx)
         return
     end
@@ -4768,13 +5040,34 @@ function Module:ReturnToCampTick(ctx)
 
     if ctx.now - attempt.returnNavIssuedAt < 5000 then return end
 
-    if Math.GetDistanceSquared(mq.TLO.Me.X(), mq.TLO.Me.Y(), returnLoc.x, returnLoc.y) > Config:GetSetting('AutoCampRadius') ^ 2 then
+    local distanceToCampSq = Math.GetDistanceSquared(mq.TLO.Me.X(), mq.TLO.Me.Y(), returnLoc.x, returnLoc.y)
+    local arrivalRadius = ctx.policy.successCheck == 'batchCount' and 5 or Config:GetSetting('AutoCampRadius')
+    if distanceToCampSq > arrivalRadius ^ 2 then
         Logger.log_warn("PULL: Failed to reach camp (dist %.0f) - puller is stuck in the field",
-            math.sqrt(Math.GetDistanceSquared(mq.TLO.Me.X(), mq.TLO.Me.Y(), returnLoc.x, returnLoc.y)))
+            math.sqrt(distanceToCampSq))
+        if ctx.policy.successCheck == 'batchCount' then
+            Logger.log_debug("PULL: Batch return is %.0f units from the exact camp spot (arrival radius %.0f); retrying navigation before releasing peers.",
+                math.sqrt(distanceToCampSq), arrivalRadius)
+            Movement:DoNav(false, "locyxz %0.2f %0.2f %0.2f log=off %s", returnLoc.y, returnLoc.x, returnLoc.z,
+                Config:GetSetting('PullBackwards') and "facing=backward" or "")
+            attempt.returnNavIssuedAt = ctx.now
+            return
+        end
         self:Announce("None", "Failed to return to camp - manual intervention may be needed!")
     end
 
     if attempt.abortReason then
+        if ctx.policy.successCheck == 'batchCount' then
+            self:ReleaseBatchPeers()
+            self.TempSettings.BatchCollecting = false
+        end
+        self:CloseAttempt(ctx)
+        return
+    end
+
+    if ctx.policy.successCheck == 'batchCount' then
+        self:ReleaseBatchPeers()
+        self.TempSettings.BatchCollecting = false
         self:CloseAttempt(ctx)
         return
     end
@@ -4836,6 +5129,7 @@ function Module:PullTick()
         self:ClearEscortState()
         self.TempSettings.CampTravelLoc = nil
         self.TempSettings.Travel = nil
+        self:SetCircuitTravelBackoff(false)
         if mq.TLO.Navigation.Active() then Movement:DoNav(false, "stop log=off") end
     end
 
@@ -4944,6 +5238,9 @@ end
 function Module:StopPuller()
     if Config:GetSetting('DoPull') == false then return end
     self.TempSettings.PausePulls = false
+    self:ReleaseBatchPeers()
+    self:SetCircuitTravelBackoff(false)
+    self.TempSettings.BatchCollecting = false
     self:ClearEscortState()
     if (self.TempSettings.CampTravelLoc or self.TempSettings.Travel) and mq.TLO.Navigation.Active() then
         Movement:DoNav(false, "stop log=off")
@@ -5017,6 +5314,8 @@ function Module:ResetPullMachine()
         end
     end
     self:ClearEscortState()
+    self:ReleaseBatchPeers()
+    self:SetCircuitTravelBackoff(false)
     self.TempSettings.Attempt = nil
     self.TempSettings.Travel = nil
     self.TempSettings.CampTravelLoc = nil
@@ -5025,6 +5324,8 @@ function Module:ResetPullMachine()
     self.TempSettings.TravelFailSince = 0
     self.TempSettings.CircuitSkips = 0
     self.TempSettings.ReachedWP = false
+    self.TempSettings.BatchCollecting = false
+    self.TempSettings.BatchPullComplete = false
     self:SetPullState(PullStates.PULL_IDLE, "")
 end
 

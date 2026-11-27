@@ -219,8 +219,9 @@ Module.Steps           = {
         Anchors = { "Category:Pull Rules", },
         Faq = "pull",
         Text =
-            "Pull Mode and Pull Ability are chosen on the Pull tab of the main window. /rgl pullmode <camp|chain|area|roam|circuit|fightto> changes the mode, and /rgl pullstart and /rgl pullstop toggle pulling.\n\n" ..
+            "Pull Mode and Pull Ability are chosen on the Pull tab of the main window. /rgl pullmode <camp|chain|batch|area|roam|circuit|fightto> changes the mode, and /rgl pullstart and /rgl pullstop toggle pulling.\n\n" ..
             "Camp Pull Radius: how far from camp to scan for targets in camp modes. Max Path Range: the maximum travel distance, measured along the actual path.\n\n" ..
+            "Circuit Hunt's Ignore Aggro While Traveling setting keeps the puller moving between Pull Locations without engaging incidental aggro before arrival. Single Lap (Saved Pull Locations) stops pulls after the last enabled location instead of looping.\n\n" ..
             "Pull Min Con and Pull Max Con: the con color range of valid targets.\n\n" ..
             "The Pull Allow, Deny and Preferred lists on the Pull tab filter targets by name; /rgl pulldeny \"<name>\" adds your target to the Deny list.",
     },
